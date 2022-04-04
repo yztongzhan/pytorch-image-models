@@ -21,7 +21,7 @@ import torch
 from torch import nn
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from .helpers import build_model_with_cfg, overlay_external_default_cfg
+from .helpers import build_model_with_cfg
 from .layers import trunc_normal_, to_2tuple
 from .registry import register_model
 from .vision_transformer import Block
@@ -125,10 +125,8 @@ class ConvHeadPooling(nn.Module):
         self.fc = nn.Linear(in_feature, out_feature)
 
     def forward(self, x, cls_token) -> Tuple[torch.Tensor, torch.Tensor]:
-
         x = self.conv(x)
         cls_token = self.fc(cls_token)
-
         return x, cls_token
 
 
@@ -149,10 +147,12 @@ class PoolingVisionTransformer(nn.Module):
     A PyTorch implement of 'Rethinking Spatial Dimensions of Vision Transformers'
         - https://arxiv.org/abs/2103.16302
     """
-    def __init__(self, img_size, patch_size, stride, base_dims, depth, heads,
-                 mlp_ratio, num_classes=1000, in_chans=3, distilled=False,
-                 attn_drop_rate=.0, drop_rate=.0, drop_path_rate=.0):
+    def __init__(
+            self, img_size, patch_size, stride, base_dims, depth, heads,
+            mlp_ratio, num_classes=1000, in_chans=3, global_pool='token',
+            distilled=False, attn_drop_rate=.0, drop_rate=.0, drop_path_rate=.0):
         super(PoolingVisionTransformer, self).__init__()
+        assert global_pool in ('token',)
 
         padding = 0
         img_size = to_2tuple(img_size)
@@ -163,6 +163,7 @@ class PoolingVisionTransformer(nn.Module):
         self.base_dims = base_dims
         self.heads = heads
         self.num_classes = num_classes
+        self.global_pool = global_pool
         self.num_tokens = 2 if distilled else 1
 
         self.patch_size = patch_size
@@ -186,12 +187,14 @@ class PoolingVisionTransformer(nn.Module):
             ]
         self.transformers = SequentialTuple(*transformers)
         self.norm = nn.LayerNorm(base_dims[-1] * heads[-1], eps=1e-6)
-        self.embed_dim = base_dims[-1] * heads[-1]
+        self.num_features = self.embed_dim = base_dims[-1] * heads[-1]
 
         # Classifier head
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-        self.head_dist = nn.Linear(self.embed_dim, self.num_classes) \
-            if num_classes > 0 and distilled else nn.Identity()
+        self.head_dist = None
+        if distilled:
+            self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if num_classes > 0 else nn.Identity()
+        self.distilled_training = False  # must set this True to train w/ distillation token
 
         trunc_normal_(self.pos_embed, std=.02)
         trunc_normal_(self.cls_token, std=.02)
@@ -206,14 +209,25 @@ class PoolingVisionTransformer(nn.Module):
     def no_weight_decay(self):
         return {'pos_embed', 'cls_token'}
 
-    def get_classifier(self):
-        return self.head
+    @torch.jit.ignore
+    def set_distilled_training(self, enable=True):
+        self.distilled_training = enable
 
-    def reset_classifier(self, num_classes, global_pool=''):
+    @torch.jit.ignore
+    def set_grad_checkpointing(self, enable=True):
+        assert not enable, 'gradient checkpointing not supported'
+
+    def get_classifier(self):
+        if self.head_dist is not None:
+            return self.head, self.head_dist
+        else:
+            return self.head
+
+    def reset_classifier(self, num_classes, global_pool=None):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-        self.head_dist = nn.Linear(self.embed_dim, self.num_classes) \
-            if num_classes > 0 and self.num_tokens == 2 else nn.Identity()
+        if self.head_dist is not None:
+            self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x):
         x = self.patch_embed(x)
@@ -223,17 +237,30 @@ class PoolingVisionTransformer(nn.Module):
         cls_tokens = self.norm(cls_tokens)
         return cls_tokens
 
+    def forward_head(self, x, pre_logits: bool = False) -> torch.Tensor:
+        if self.head_dist is not None:
+            assert self.global_pool == 'token'
+            x, x_dist = x[:, 0], x[:, 1]
+            if not pre_logits:
+                x = self.head(x)
+                x_dist = self.head_dist(x_dist)
+            if self.distilled_training and self.training and not torch.jit.is_scripting():
+                # only return separate classification predictions when training in distilled mode
+                return x, x_dist
+            else:
+                # during standard train / finetune, inference average the classifier predictions
+                return (x + x_dist) / 2
+        else:
+            if self.global_pool == 'token':
+                x = x[:, 0]
+            if not pre_logits:
+                x = self.head(x)
+            return x
+
     def forward(self, x):
         x = self.forward_features(x)
-        x_cls = self.head(x[:, 0])
-        if self.num_tokens > 1:
-            x_dist = self.head_dist(x[:, 1])
-            if self.training and not torch.jit.is_scripting():
-                return x_cls, x_dist
-            else:
-                return (x_cls + x_dist) / 2
-        else:
-            return x_cls
+        x = self.forward_head(x)
+        return x
 
 
 def checkpoint_filter_fn(state_dict, model):
@@ -251,24 +278,13 @@ def checkpoint_filter_fn(state_dict, model):
 
 
 def _create_pit(variant, pretrained=False, **kwargs):
-    default_cfg = deepcopy(default_cfgs[variant])
-    overlay_external_default_cfg(default_cfg, kwargs)
-    default_num_classes = default_cfg['num_classes']
-    default_img_size = default_cfg['input_size'][-2:]
-    img_size = kwargs.pop('img_size', default_img_size)
-    num_classes = kwargs.pop('num_classes', default_num_classes)
-
     if kwargs.get('features_only', None):
         raise RuntimeError('features_only not implemented for Vision Transformer models.')
 
     model = build_model_with_cfg(
         PoolingVisionTransformer, variant, pretrained,
-        default_cfg=default_cfg,
-        img_size=img_size,
-        num_classes=num_classes,
         pretrained_filter_fn=checkpoint_filter_fn,
         **kwargs)
-
     return model
 
 

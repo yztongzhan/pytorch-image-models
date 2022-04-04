@@ -26,7 +26,8 @@ import torch
 import torch.nn as nn
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from .helpers import build_model_with_cfg
+from .fx_features import register_notrace_module
+from .helpers import build_model_with_cfg, checkpoint_seq
 from .registry import register_model
 from .layers import ClassifierHead, DropPath, AvgPool2dSame, ScaledStdConv2d, ScaledStdConv2dSame,\
     get_act_layer, get_act_fn, get_attn, make_divisible
@@ -83,33 +84,22 @@ default_cfgs = dict(
     nfnet_f7=_dcfg(
         url='', pool_size=(15, 15), input_size=(3, 480, 480), test_input_size=(3, 608, 608)),
 
-    nfnet_f0s=_dcfg(
-        url='', pool_size=(6, 6), input_size=(3, 192, 192), test_input_size=(3, 256, 256)),
-    nfnet_f1s=_dcfg(
-        url='', pool_size=(7, 7), input_size=(3, 224, 224), test_input_size=(3, 320, 320)),
-    nfnet_f2s=_dcfg(
-        url='', pool_size=(8, 8), input_size=(3, 256, 256), test_input_size=(3, 352, 352)),
-    nfnet_f3s=_dcfg(
-        url='', pool_size=(10, 10), input_size=(3, 320, 320), test_input_size=(3, 416, 416)),
-    nfnet_f4s=_dcfg(
-        url='', pool_size=(12, 12), input_size=(3, 384, 384), test_input_size=(3, 512, 512)),
-    nfnet_f5s=_dcfg(
-        url='', pool_size=(13, 13), input_size=(3, 416, 416), test_input_size=(3, 544, 544)),
-    nfnet_f6s=_dcfg(
-        url='', pool_size=(14, 14), input_size=(3, 448, 448), test_input_size=(3, 576, 576)),
-    nfnet_f7s=_dcfg(
-        url='', pool_size=(15, 15), input_size=(3, 480, 480), test_input_size=(3, 608, 608)),
-
     nfnet_l0=_dcfg(
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights/nfnet_l0_ra2-45c6688d.pth',
         pool_size=(7, 7), input_size=(3, 224, 224), test_input_size=(3, 288, 288), crop_pct=1.0),
     eca_nfnet_l0=_dcfg(
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights/ecanfnet_l0_ra2-e3e9ac50.pth',
-        hf_hub='timm/eca_nfnet_l0',
+        hf_hub_id='timm/eca_nfnet_l0',
         pool_size=(7, 7), input_size=(3, 224, 224), test_input_size=(3, 288, 288), crop_pct=1.0),
     eca_nfnet_l1=_dcfg(
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights/ecanfnet_l1_ra2-7dce93cd.pth',
         pool_size=(8, 8), input_size=(3, 256, 256), test_input_size=(3, 320, 320), crop_pct=1.0),
+    eca_nfnet_l2=_dcfg(
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights/ecanfnet_l2_ra3-da781a61.pth',
+        pool_size=(10, 10), input_size=(3, 320, 320), test_input_size=(3, 384, 384), crop_pct=1.0),
+    eca_nfnet_l3=_dcfg(
+        url='',
+        pool_size=(11, 11), input_size=(3, 352, 352), test_input_size=(3, 448, 448), crop_pct=1.0),
 
     nf_regnet_b0=_dcfg(
         url='', pool_size=(6, 6), input_size=(3, 192, 192), test_input_size=(3, 256, 256), first_conv='stem.conv'),
@@ -160,6 +150,7 @@ class NfCfg:
     extra_conv: bool = False  # extra 3x3 bottleneck convolution for NFNet models
     gamma_in_act: bool = False
     same_padding: bool = False
+    std_conv_eps: float = 1e-5
     skipinit: bool = False  # disabled by default, non-trivial performance impact
     zero_init_fc: bool = False
     act_layer: str = 'silu'
@@ -176,7 +167,7 @@ def _nfres_cfg(
 
 def _nfreg_cfg(depths, channels=(48, 104, 208, 440)):
     num_features = 1280 * channels[-1] // 440
-    attn_kwargs = dict(reduction_ratio=0.5, divisor=8)
+    attn_kwargs = dict(rd_ratio=0.5)
     cfg = NfCfg(
         depths=depths, channels=channels, stem_type='3x3', group_size=8, width_factor=0.75, bottle_ratio=2.25,
         num_features=num_features, reg=True, attn_layer='se', attn_kwargs=attn_kwargs)
@@ -187,7 +178,7 @@ def _nfnet_cfg(
         depths, channels=(256, 512, 1536, 1536), group_size=128, bottle_ratio=0.5, feat_mult=2.,
         act_layer='gelu', attn_layer='se', attn_kwargs=None):
     num_features = int(channels[-1] * feat_mult)
-    attn_kwargs = attn_kwargs if attn_kwargs is not None else dict(reduction_ratio=0.5, divisor=8)
+    attn_kwargs = attn_kwargs if attn_kwargs is not None else dict(rd_ratio=0.5)
     cfg = NfCfg(
         depths=depths, channels=channels, stem_type='deep_quad', stem_chs=128, group_size=group_size,
         bottle_ratio=bottle_ratio, extra_conv=True, num_features=num_features, act_layer=act_layer,
@@ -196,11 +187,10 @@ def _nfnet_cfg(
 
 
 def _dm_nfnet_cfg(depths, channels=(256, 512, 1536, 1536), act_layer='gelu', skipinit=True):
-    attn_kwargs = dict(reduction_ratio=0.5, divisor=8)
     cfg = NfCfg(
         depths=depths, channels=channels, stem_type='deep_quad', stem_chs=128, group_size=128,
         bottle_ratio=0.5, extra_conv=True, gamma_in_act=True, same_padding=True, skipinit=skipinit,
-        num_features=int(channels[-1] * 2.0), act_layer=act_layer, attn_layer='se', attn_kwargs=attn_kwargs)
+        num_features=int(channels[-1] * 2.0), act_layer=act_layer, attn_layer='se', attn_kwargs=dict(rd_ratio=0.5))
     return cfg
 
 
@@ -214,7 +204,7 @@ model_cfgs = dict(
     dm_nfnet_f5=_dm_nfnet_cfg(depths=(6, 12, 36, 18)),
     dm_nfnet_f6=_dm_nfnet_cfg(depths=(7, 14, 42, 21)),
 
-    # NFNet-F models w/ GELU (I will likely deprecate/remove these models and just keep dm_ ver for GELU)
+    # NFNet-F models w/ GELU
     nfnet_f0=_nfnet_cfg(depths=(1, 2, 6, 3)),
     nfnet_f1=_nfnet_cfg(depths=(2, 4, 12, 6)),
     nfnet_f2=_nfnet_cfg(depths=(3, 6, 18, 9)),
@@ -224,25 +214,21 @@ model_cfgs = dict(
     nfnet_f6=_nfnet_cfg(depths=(7, 14, 42, 21)),
     nfnet_f7=_nfnet_cfg(depths=(8, 16, 48, 24)),
 
-    # NFNet-F models w/ SiLU (much faster in PyTorch)
-    nfnet_f0s=_nfnet_cfg(depths=(1, 2, 6, 3), act_layer='silu'),
-    nfnet_f1s=_nfnet_cfg(depths=(2, 4, 12, 6), act_layer='silu'),
-    nfnet_f2s=_nfnet_cfg(depths=(3, 6, 18, 9), act_layer='silu'),
-    nfnet_f3s=_nfnet_cfg(depths=(4, 8, 24, 12), act_layer='silu'),
-    nfnet_f4s=_nfnet_cfg(depths=(5, 10, 30, 15), act_layer='silu'),
-    nfnet_f5s=_nfnet_cfg(depths=(6, 12, 36, 18), act_layer='silu'),
-    nfnet_f6s=_nfnet_cfg(depths=(7, 14, 42, 21), act_layer='silu'),
-    nfnet_f7s=_nfnet_cfg(depths=(8, 16, 48, 24), act_layer='silu'),
-
     # Experimental 'light' versions of NFNet-F that are little leaner
     nfnet_l0=_nfnet_cfg(
         depths=(1, 2, 6, 3), feat_mult=1.5, group_size=64, bottle_ratio=0.25,
-        attn_kwargs=dict(reduction_ratio=0.25, divisor=8), act_layer='silu'),
+        attn_kwargs=dict(rd_ratio=0.25, rd_divisor=8), act_layer='silu'),
     eca_nfnet_l0=_nfnet_cfg(
         depths=(1, 2, 6, 3), feat_mult=1.5, group_size=64, bottle_ratio=0.25,
         attn_layer='eca', attn_kwargs=dict(), act_layer='silu'),
     eca_nfnet_l1=_nfnet_cfg(
         depths=(2, 4, 12, 6), feat_mult=2, group_size=64, bottle_ratio=0.25,
+        attn_layer='eca', attn_kwargs=dict(), act_layer='silu'),
+    eca_nfnet_l2=_nfnet_cfg(
+        depths=(3, 6, 18, 9), feat_mult=2, group_size=64, bottle_ratio=0.25,
+        attn_layer='eca', attn_kwargs=dict(), act_layer='silu'),
+    eca_nfnet_l3=_nfnet_cfg(
+        depths=(4, 8, 24, 12), feat_mult=2, group_size=64, bottle_ratio=0.25,
         attn_layer='eca', attn_kwargs=dict(), act_layer='silu'),
 
     # EffNet influenced RegNet defs.
@@ -260,9 +246,9 @@ model_cfgs = dict(
     nf_resnet50=_nfres_cfg(depths=(3, 4, 6, 3)),
     nf_resnet101=_nfres_cfg(depths=(3, 4, 23, 3)),
 
-    nf_seresnet26=_nfres_cfg(depths=(2, 2, 2, 2), attn_layer='se', attn_kwargs=dict(reduction_ratio=1/16)),
-    nf_seresnet50=_nfres_cfg(depths=(3, 4, 6, 3), attn_layer='se', attn_kwargs=dict(reduction_ratio=1/16)),
-    nf_seresnet101=_nfres_cfg(depths=(3, 4, 23, 3), attn_layer='se', attn_kwargs=dict(reduction_ratio=1/16)),
+    nf_seresnet26=_nfres_cfg(depths=(2, 2, 2, 2), attn_layer='se', attn_kwargs=dict(rd_ratio=1/16)),
+    nf_seresnet50=_nfres_cfg(depths=(3, 4, 6, 3), attn_layer='se', attn_kwargs=dict(rd_ratio=1/16)),
+    nf_seresnet101=_nfres_cfg(depths=(3, 4, 23, 3), attn_layer='se', attn_kwargs=dict(rd_ratio=1/16)),
 
     nf_ecaresnet26=_nfres_cfg(depths=(2, 2, 2, 2), attn_layer='eca', attn_kwargs=dict()),
     nf_ecaresnet50=_nfres_cfg(depths=(3, 4, 6, 3), attn_layer='eca', attn_kwargs=dict()),
@@ -305,6 +291,7 @@ class DownsampleAvg(nn.Module):
         return self.conv(self.pool(x))
 
 
+@register_notrace_module  # reason: mul_ causes FX to drop a relevant node. https://github.com/pytorch/pytorch/issues/68301
 class NormFreeBlock(nn.Module):
     """Normalization-Free pre-activation block.
     """
@@ -462,19 +449,23 @@ class NormFreeNet(nn.Module):
         * skipinit is disabled by default, it seems to have a rather drastic impact on GPU memory use and throughput
             for what it is/does. Approx 8-10% throughput loss.
     """
-    def __init__(self, cfg: NfCfg, num_classes=1000, in_chans=3, global_pool='avg', output_stride=32,
-                 drop_rate=0., drop_path_rate=0.):
+    def __init__(
+            self, cfg: NfCfg, num_classes=1000, in_chans=3, global_pool='avg', output_stride=32,
+            drop_rate=0., drop_path_rate=0.
+    ):
         super().__init__()
         self.num_classes = num_classes
         self.drop_rate = drop_rate
+        self.grad_checkpointing = False
+
         assert cfg.act_layer in _nonlin_gamma, f"Please add non-linearity constants for activation ({cfg.act_layer})."
         conv_layer = ScaledStdConv2dSame if cfg.same_padding else ScaledStdConv2d
         if cfg.gamma_in_act:
             act_layer = act_with_gamma(cfg.act_layer, gamma=_nonlin_gamma[cfg.act_layer])
-            conv_layer = partial(conv_layer, eps=1e-4)  # DM weights better with higher eps
+            conv_layer = partial(conv_layer, eps=cfg.std_conv_eps)
         else:
             act_layer = get_act_layer(cfg.act_layer)
-            conv_layer = partial(conv_layer, gamma=_nonlin_gamma[cfg.act_layer])
+            conv_layer = partial(conv_layer, gamma=_nonlin_gamma[cfg.act_layer], eps=cfg.std_conv_eps)
         attn_layer = partial(get_attn(cfg.attn_layer), **cfg.attn_kwargs) if cfg.attn_layer else None
 
         stem_chs = make_divisible((cfg.stem_chs or cfg.channels[0]) * cfg.width_factor, cfg.ch_div)
@@ -553,6 +544,22 @@ class NormFreeNet(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+    @torch.jit.ignore
+    def group_matcher(self, coarse=False):
+        matcher = dict(
+            stem=r'^stem',
+            blocks=[
+                (r'^stages\.(\d+)' if coarse else r'^stages\.(\d+)\.(\d+)', None),
+                (r'^final_conv', (99999,))
+            ]
+        )
+        return matcher
+
+    @torch.jit.ignore
+    def set_grad_checkpointing(self, enable=True):
+        self.grad_checkpointing = enable
+
+    @torch.jit.ignore
     def get_classifier(self):
         return self.head.fc
 
@@ -561,14 +568,20 @@ class NormFreeNet(nn.Module):
 
     def forward_features(self, x):
         x = self.stem(x)
-        x = self.stages(x)
+        if self.grad_checkpointing and not torch.jit.is_scripting():
+            x = checkpoint_seq(self.stages, x)
+        else:
+            x = self.stages(x)
         x = self.final_conv(x)
         x = self.final_act(x)
         return x
 
+    def forward_head(self, x):
+        return self.head(x)
+
     def forward(self, x):
         x = self.forward_features(x)
-        x = self.head(x)
+        x = self.forward_head(x)
         return x
 
 
@@ -577,7 +590,6 @@ def _create_normfreenet(variant, pretrained=False, **kwargs):
     feature_cfg = dict(flatten_sequential=True)
     return build_model_with_cfg(
         NormFreeNet, variant, pretrained,
-        default_cfg=default_cfgs[variant],
         model_cfg=model_cfg,
         feature_cfg=feature_cfg,
         **kwargs)
@@ -719,78 +731,6 @@ def nfnet_f7(pretrained=False, **kwargs):
 
 
 @register_model
-def nfnet_f0s(pretrained=False, **kwargs):
-    """ NFNet-F0 w/ SiLU
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
-    return _create_normfreenet('nfnet_f0s', pretrained=pretrained, **kwargs)
-
-
-@register_model
-def nfnet_f1s(pretrained=False, **kwargs):
-    """ NFNet-F1 w/ SiLU
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
-    return _create_normfreenet('nfnet_f1s', pretrained=pretrained, **kwargs)
-
-
-@register_model
-def nfnet_f2s(pretrained=False, **kwargs):
-    """ NFNet-F2 w/ SiLU
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
-    return _create_normfreenet('nfnet_f2s', pretrained=pretrained, **kwargs)
-
-
-@register_model
-def nfnet_f3s(pretrained=False, **kwargs):
-    """ NFNet-F3 w/ SiLU
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
-    return _create_normfreenet('nfnet_f3s', pretrained=pretrained, **kwargs)
-
-
-@register_model
-def nfnet_f4s(pretrained=False, **kwargs):
-    """ NFNet-F4 w/ SiLU
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
-    return _create_normfreenet('nfnet_f4s', pretrained=pretrained, **kwargs)
-
-
-@register_model
-def nfnet_f5s(pretrained=False, **kwargs):
-    """ NFNet-F5 w/ SiLU
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
-    return _create_normfreenet('nfnet_f5s', pretrained=pretrained, **kwargs)
-
-
-@register_model
-def nfnet_f6s(pretrained=False, **kwargs):
-    """ NFNet-F6 w/ SiLU
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
-    return _create_normfreenet('nfnet_f6s', pretrained=pretrained, **kwargs)
-
-
-@register_model
-def nfnet_f7s(pretrained=False, **kwargs):
-    """ NFNet-F7 w/ SiLU
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
-    return _create_normfreenet('nfnet_f7s', pretrained=pretrained, **kwargs)
-
-
-@register_model
 def nfnet_l0(pretrained=False, **kwargs):
     """ NFNet-L0b w/ SiLU
     My experimental 'light' model w/ F0 repeats, 1.5x final_conv mult, 64 group_size, .25 bottleneck & SE ratio
@@ -812,6 +752,22 @@ def eca_nfnet_l1(pretrained=False, **kwargs):
     My experimental 'light' model w/ F1 repeats, 2.0x final_conv mult, 64 group_size, .25 bottleneck & ECA attn
     """
     return _create_normfreenet('eca_nfnet_l1', pretrained=pretrained, **kwargs)
+
+
+@register_model
+def eca_nfnet_l2(pretrained=False, **kwargs):
+    """ ECA-NFNet-L2 w/ SiLU
+    My experimental 'light' model w/ F2 repeats, 2.0x final_conv mult, 64 group_size, .25 bottleneck & ECA attn
+    """
+    return _create_normfreenet('eca_nfnet_l2', pretrained=pretrained, **kwargs)
+
+
+@register_model
+def eca_nfnet_l3(pretrained=False, **kwargs):
+    """ ECA-NFNet-L3 w/ SiLU
+    My experimental 'light' model w/ F3 repeats, 2.0x final_conv mult, 64 group_size, .25 bottleneck & ECA attn
+    """
+    return _create_normfreenet('eca_nfnet_l3', pretrained=pretrained, **kwargs)
 
 
 @register_model

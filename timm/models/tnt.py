@@ -9,13 +9,15 @@ https://gitee.com/mindspore/mindspore/tree/master/model_zoo/research/cv/TNT
 import math
 import torch
 import torch.nn as nn
-from functools import partial
+from torch.utils.checkpoint import checkpoint
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.models.helpers import load_pretrained
-from timm.models.layers import DropPath, trunc_normal_
-from timm.models.vision_transformer import Mlp
+from timm.models.helpers import build_model_with_cfg
+from timm.models.layers import Mlp, DropPath, trunc_normal_
+from timm.models.layers.helpers import to_2tuple
+from timm.models.layers import _assert
 from timm.models.registry import register_model
+from timm.models.vision_transformer import resize_pos_embed
 
 
 def _cfg(url='', **kwargs):
@@ -60,7 +62,7 @@ class Attention(nn.Module):
     def forward(self, x):
         B, N, C = x.shape
         qk = self.qk(x).reshape(B, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k = qk[0], qk[1]   # make torchscript happy (cannot use tensor as tuple)
+        q, k = qk.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
         v = self.v(x).reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
@@ -76,7 +78,8 @@ class Attention(nn.Module):
 class Block(nn.Module):
     """ TNT Block
     """
-    def __init__(self, dim, in_dim, num_pixel, num_heads=12, in_num_head=4, mlp_ratio=4.,
+    def __init__(
+            self, dim, in_dim, num_pixel, num_heads=12, in_num_head=4, mlp_ratio=4.,
             qkv_bias=False, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
         # Inner transformer
@@ -108,7 +111,9 @@ class Block(nn.Module):
         pixel_embed = pixel_embed + self.drop_path(self.mlp_in(self.norm_mlp_in(pixel_embed)))
         # outer
         B, N, C = patch_embed.size()
-        patch_embed[:, 1:] = patch_embed[:, 1:] + self.proj(self.norm1_proj(pixel_embed).reshape(B, N - 1, -1))
+        patch_embed = torch.cat(
+            [patch_embed[:, 0:1], patch_embed[:, 1:] + self.proj(self.norm1_proj(pixel_embed).reshape(B, N - 1, -1))],
+            dim=1)
         patch_embed = patch_embed + self.drop_path(self.attn_out(self.norm_out(patch_embed)))
         patch_embed = patch_embed + self.drop_path(self.mlp(self.norm_mlp(patch_embed)))
         return pixel_embed, patch_embed
@@ -119,11 +124,15 @@ class PixelEmbed(nn.Module):
     """
     def __init__(self, img_size=224, patch_size=16, in_chans=3, in_dim=48, stride=4):
         super().__init__()
-        num_patches = (img_size // patch_size) ** 2
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+        # grid_size property necessary for resizing positional embedding
+        self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
+        num_patches = (self.grid_size[0]) * (self.grid_size[1])
         self.img_size = img_size
         self.num_patches = num_patches
         self.in_dim = in_dim
-        new_patch_size = math.ceil(patch_size / stride)
+        new_patch_size = [math.ceil(ps / stride) for ps in patch_size]
         self.new_patch_size = new_patch_size
 
         self.proj = nn.Conv2d(in_chans, self.in_dim, kernel_size=7, padding=3, stride=stride)
@@ -131,11 +140,13 @@ class PixelEmbed(nn.Module):
 
     def forward(self, x, pixel_pos):
         B, C, H, W = x.shape
-        assert H == self.img_size and W == self.img_size, \
-            f"Input image size ({H}*{W}) doesn't match model ({self.img_size}*{self.img_size})."
+        _assert(H == self.img_size[0],
+            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]}).")
+        _assert(W == self.img_size[1],
+            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]}).")
         x = self.proj(x)
         x = self.unfold(x)
-        x = x.transpose(1, 2).reshape(B * self.num_patches, self.in_dim, self.new_patch_size, self.new_patch_size)
+        x = x.transpose(1, 2).reshape(B * self.num_patches, self.in_dim, self.new_patch_size[0], self.new_patch_size[1])
         x = x + pixel_pos
         x = x.reshape(B * self.num_patches, self.in_dim, -1).transpose(1, 2)
         return x
@@ -144,19 +155,23 @@ class PixelEmbed(nn.Module):
 class TNT(nn.Module):
     """ Transformer in Transformer - https://arxiv.org/abs/2103.00112
     """
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, in_dim=48, depth=12,
-                 num_heads=12, in_num_head=4, mlp_ratio=4., qkv_bias=False, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, first_stride=4):
+    def __init__(
+            self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, global_pool='token',
+            embed_dim=768, in_dim=48, depth=12, num_heads=12, in_num_head=4, mlp_ratio=4., qkv_bias=False,
+            drop_rate=0., attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm, first_stride=4):
         super().__init__()
+        assert global_pool in ('', 'token', 'avg')
         self.num_classes = num_classes
+        self.global_pool = global_pool
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
+        self.grad_checkpointing = False
 
         self.pixel_embed = PixelEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, in_dim=in_dim, stride=first_stride)
         num_patches = self.pixel_embed.num_patches
         self.num_patches = num_patches
         new_patch_size = self.pixel_embed.new_patch_size
-        num_pixel = new_patch_size ** 2
+        num_pixel = new_patch_size[0] * new_patch_size[1]
         
         self.norm1_proj = norm_layer(num_pixel * in_dim)
         self.proj = nn.Linear(num_pixel * in_dim, embed_dim)
@@ -164,7 +179,7 @@ class TNT(nn.Module):
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.patch_pos = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
-        self.pixel_pos = nn.Parameter(torch.zeros(1, in_dim, new_patch_size, new_patch_size))
+        self.pixel_pos = nn.Parameter(torch.zeros(1, in_dim, new_patch_size[0], new_patch_size[1]))
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
@@ -197,11 +212,29 @@ class TNT(nn.Module):
     def no_weight_decay(self):
         return {'patch_pos', 'pixel_pos', 'cls_token'}
 
+    @torch.jit.ignore
+    def group_matcher(self, coarse=False):
+        matcher = dict(
+            stem=r'^cls_token|patch_pos|pixel_pos|pixel_embed|norm[12]_proj|proj',  # stem and embed / pos
+            blocks=[
+                (r'^blocks\.(\d+)', None),
+                (r'^norm', (99999,)),
+            ]
+        )
+        return matcher
+
+    @torch.jit.ignore
+    def set_grad_checkpointing(self, enable=True):
+        self.grad_checkpointing = enable
+
+    @torch.jit.ignore
     def get_classifier(self):
         return self.head
 
-    def reset_classifier(self, num_classes, global_pool=''):
+    def reset_classifier(self, num_classes, global_pool=None):
         self.num_classes = num_classes
+        if global_pool is not None:
+            assert global_pool in ('', 'token', 'avg')
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x):
@@ -213,35 +246,59 @@ class TNT(nn.Module):
         patch_embed = patch_embed + self.patch_pos
         patch_embed = self.pos_drop(patch_embed)
 
-        for blk in self.blocks:
-            pixel_embed, patch_embed = blk(pixel_embed, patch_embed)
+        if self.grad_checkpointing and not torch.jit.is_scripting():
+            for blk in self.blocks:
+                pixel_embed, patch_embed = checkpoint(blk, pixel_embed, patch_embed)
+        else:
+            for blk in self.blocks:
+                pixel_embed, patch_embed = blk(pixel_embed, patch_embed)
 
         patch_embed = self.norm(patch_embed)
-        return patch_embed[:, 0]
+        return patch_embed
+
+    def forward_head(self, x, pre_logits: bool = False):
+        if self.global_pool:
+            x = x[:, 1:].mean(dim=1) if self.global_pool == 'avg' else x[:, 0]
+        return x if pre_logits else self.head(x)
 
     def forward(self, x):
         x = self.forward_features(x)
-        x = self.head(x)
+        x = self.forward_head(x)
         return x
+
+
+def checkpoint_filter_fn(state_dict, model):
+    """ convert patch embedding weight from manual patchify + linear proj to conv"""
+    if state_dict['patch_pos'].shape != model.patch_pos.shape:
+        state_dict['patch_pos'] = resize_pos_embed(state_dict['patch_pos'],
+            model.patch_pos, getattr(model, 'num_tokens', 1), model.pixel_embed.grid_size)
+    return state_dict
+
+
+def _create_tnt(variant, pretrained=False, **kwargs):
+    if kwargs.get('features_only', None):
+        raise RuntimeError('features_only not implemented for Vision Transformer models.')
+
+    model = build_model_with_cfg(
+        TNT, variant, pretrained,
+        pretrained_filter_fn=checkpoint_filter_fn,
+        **kwargs)
+    return model
 
 
 @register_model
 def tnt_s_patch16_224(pretrained=False, **kwargs):
-    model = TNT(patch_size=16, embed_dim=384, in_dim=24, depth=12, num_heads=6, in_num_head=4,
+    model_cfg = dict(
+        patch_size=16, embed_dim=384, in_dim=24, depth=12, num_heads=6, in_num_head=4,
         qkv_bias=False, **kwargs)
-    model.default_cfg = default_cfgs['tnt_s_patch16_224']
-    if pretrained:
-        load_pretrained(
-            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    model = _create_tnt('tnt_s_patch16_224', pretrained=pretrained, **model_cfg)
     return model
 
 
 @register_model
 def tnt_b_patch16_224(pretrained=False, **kwargs):
-    model = TNT(patch_size=16, embed_dim=640, in_dim=40, depth=12, num_heads=10, in_num_head=4,
+    model_cfg = dict(
+        patch_size=16, embed_dim=640, in_dim=40, depth=12, num_heads=10, in_num_head=4,
         qkv_bias=False, **kwargs)
-    model.default_cfg = default_cfgs['tnt_b_patch16_224']
-    if pretrained:
-        load_pretrained(
-            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    model = _create_tnt('tnt_b_patch16_224', pretrained=pretrained, **model_cfg)
     return model
